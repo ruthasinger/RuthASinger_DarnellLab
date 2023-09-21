@@ -1,0 +1,406 @@
+#!/bin/bash
+
+#############################################################################################
+# Author: Ruth A Singer
+# Email: rsinger01@rockefeller.edu
+#based on CTK pipeline
+#Shah,A., Qian,Y., Weyn-Vanhentenryck,S.M., Zhang,C. 2017.
+
+#############################################################################################
+# requirements: 
+#czplib (perl): a perl library with various functions for genomic/bioinformatic analysis
+#CTK (perl): the core algorithm.
+#FASTX Tool-Kit Version 0.0.13: http://hannonlab.cshl.edu/fastx_toolkit/download.html
+#cutadapt Version 1.14: https://pypi.python.org/pypi/cutadapt/ (an alternative to FASTX Tool-Kit)
+#Burrows Wheeler Aligner (BWA) Version 0.7.12: http://bio-bwa.sourceforge.net/
+#Samtools Version 1.3.1: http://samtools.sourceforge.net
+#Perl Version 5.14.3 https://www.perl.org/get.html
+#Perl library Math::CDF Version 0.1: http://search.cpan.org/~callahan/Math-CDF-0.1/CDF.pm
+
+#############################################################################################
+#current usage: bash CLIP_fastq2tags . 20210927-RS-EH-CLIP_S1_L001_R1_001.fastq 09282021_barcodes.txt
+
+#############################################################################################
+#define variables you need before creating logfile
+
+SCRIPT=$0
+DATA_DIR=$1
+LOG_FILE=${DATA_DIR}/CLIP_pipeline.log
+
+#############################################################################################
+exec > >(tee ${LOG_FILE}) 2>&1
+
+echo "**********************************************************************"
+echo "                   RAS Pipeline for CLIP analysis					    "
+echo "             Version 01, 10-20-2021, Ruth A. Singer, PhD			    "
+echo "**********************************************************************"
+
+#Get current time
+PipelineStartTime=$(date '+%Y-%m-%d %T')
+echo "Script starting date and time is $PipelineStartTime"
+
+#############################################################################################
+#set variables and make directories
+source /Users/ruthsinger/Coding/Programs/CLIP_programs/RAS_CLIP_env.sh
+
+FASTQ=$2
+BARCODES=$3
+
+echo "Data directory is $DATA_DIR"
+echo "Script name is $SCRIPT"
+echo "Fastq file is $FASTQ"
+echo "Barcode file is $BARCODES"
+
+SRCDIR="/Users/ruthsinger/Coding/Programs/ctk/v1.1.3/ctk-1.1.3"
+DEMULTI_OUT="${DATA_DIR}/demulti"
+LEN5LUBr=16 #this number is the 6 nucleotide index + 9 nucleotide degenerate barcode 
+FILTERED_OUT="${DATA_DIR}/filtered"
+RM3LINK_OUT="${DATA_DIR}/rm3link"
+COLLAPSE_OUT="${DATA_DIR}/collapsed"
+RM5LINK_OUT="${DATA_DIR}/rm5link"
+LEN_DISTRIB_OUT="${DATA_DIR}/length_distribution_files"
+RM5LINK_OUT="${DATA_DIR}/rm5link"
+SAM_OUT="${DATA_DIR}/SAMs"
+TAGS_OUT="${DATA_DIR}/tags"
+BEDGRAPHS_OUT="${DATA_DIR}/bedgraphs"
+TAGS_ANNO_OUT="${TAGS_OUT}/annotations"
+
+mkdir -p ${DEMULTI_OUT}
+mkdir -p ${FILTERED_OUT}
+mkdir -p ${RM3LINK_OUT}
+mkdir -p ${COLLAPSE_OUT}
+mkdir -p ${RM5LINK_OUT}
+mkdir -p ${LEN_DISTRIB_OUT}
+mkdir -p ${SAM_OUT}
+mkdir -p ${TAGS_OUT}
+mkdir -p ${BEDGRAPHS_OUT}
+mkdir -p ${TAGS_ANNO_OUT}
+
+numindexes=$(cat $BARCODES | awk '{print $2}' | wc -l)
+allindexes=$(cat $BARCODES | awk '{print $2}')
+echo "There are $numindexes indexes: $allindexes"
+echo "Indicated in the $BARCODES barcode file"
+
+numsamplenames=$(cat $BARCODES | awk '{print $1}' | wc -l)
+allsamplenames=$(cat $BARCODES | awk '{print $1}')
+echo "With the corresponding $numsamplenames sample names: $allsamplenames" 
+
+allspeciesIDs=$(cat $BARCODES | awk '{print $3}')
+echo "Each sample corresponds to the following species info: $allspeciesIDs"
+
+#############################################################################################
+#set general functions
+#code for help message and usage
+
+display_usage() {
+
+    echo -e "NAME:\n  RAS Pipeline for CLIP analysis"
+
+    echo -e "\nDESCRIPTION:\n  This pipeline will take a fastq > demultiplex > filter > trim > collapse > map > SAM > tags.bed > unique.tags.bed > peaks"
+
+    echo -e "\nUsage:\n   bash $SCRIPT -1 /path/to/data -2 pooled.fastq -3 barcodes.txt "
+
+    echo "   -h|--help    show this help"
+
+    echo "   example: bash CLIP_fastq2peaks . 20210927-RS-EH-CLIP_S1_L001_R1_001.fastq 09282021_barcodes.txt"
+}
+
+#############################################################################################
+#check script parameters
+if [[ ( $1 == "--help") ||  $1 == "-h" ]] ; then 
+	display_usage
+	exit 0
+fi 
+
+#checking the right number of mandatory arguements 
+if [ $# -lt 3 ]; then
+  	echo -e "error: three arguements are required"
+	echo -e "usage: bash $SCRIPT -1 /path/to/data -2 pooled.fastq -3 barcodes.txt"
+	exit 1
+else
+ 	echo "Running $SCRIPT for fastq file $FASTQ"
+fi
+
+#############################################################################################
+#define functions
+#below is a function that will allow user input throughout the pipeline to skip steps or exit script
+function skip_function () {
+	read -p "${1} [y/n]: " choice  < /dev/tty
+	case "$choice" in 
+		 y|Y ) 
+				echo "yes...continuing with ${subscript}"
+				${2}
+				;;
+	  	n|N ) 
+				echo "skipping ${subscript}..."
+				;;
+	  	* ) 
+				echo "invalid response...exiting"
+				exit 1
+				;;
+	esac
+}
+#below is a version of the skip_function above with the -t 10 parameter that allows you to troubleshoot the pipeline or not
+#if you do nothing it will run the subscript at each step
+function skip_function_timed () {
+	read -t 10 -p "${1} [y/n]: you have 10 seconds to respond or pipeline will continue " choice  < /dev/tty
+	case "$choice" in 
+		 y|Y ) 
+				echo "yes...continuing with ${subscript}"
+				${2}
+				;;
+	  	n|N ) 
+				echo "skipping ${subscript}..."
+				;;
+	  	x|X ) 
+				echo "exiting pipeline"
+				exit 1
+				;;
+		* ) 
+				echo "nothing pressed...will continue with ${subscript}"
+				${2}
+				;;	
+	esac
+}
+	
+function fun_check () {
+	if [ $? -eq 0 ]; then
+	  	echo "${subscript} worked"
+  		ScriptEndTime=$(date '+%Y-%m-%d %T')
+  		echo "Time $subscript ended: $ScriptEndTime"
+  		Scriptdiff=$(datediff  -f "%H:%M:%S" "$ScriptStartTime" "$ScriptEndTime")
+  		echo "Script took $Scriptdiff (H:M:S) to run"
+	else
+	  	echo "${subscript} failed"
+  		ScriptEndTime=$(date '+%Y-%m-%d %T')
+  		echo "Time $subscript ended: $ScriptEndTime"
+  		Scriptdiff=$(datediff  -f "%H:%M:%S" "$ScriptStartTime" "$ScriptEndTime")
+  		echo "Script took $Scriptdiff (H:M:S) to run"
+	  	exit 1
+	fi
+}
+	
+function fun_check_email () {
+	if [ $? -eq 0 ] ; then
+	 	echo "${subscript} worked"
+	 	echo "${subscript} done" | mail -s "pipeline" $EMAIL
+		ScriptEndTime=$(date '+%Y-%m-%d %T')
+		echo "Time $subscript ended: $ScriptEndTime"
+		Scriptdiff=$(datediff  -f "%H:%M:%S" "$ScriptStartTime" "$ScriptEndTime")
+		echo "Script took $Scriptdiff (H:M:S) to run"
+	else
+	  	echo "${subscript} failed"
+		ScriptEndTime=$(date '+%Y-%m-%d %T')
+		echo "Time $subscript ended: $ScriptEndTime"
+		Scriptdiff=$(datediff  -f "%H:%M:%S" "$ScriptStartTime" "$ScriptEndTime")
+		echo "Script took $Scriptdiff (H:M:S) to run"
+	  	exit 1
+	fi
+}	
+
+#############################################################################################
+## Step 1
+#De-multiplex the data
+subscript="demultiplex"
+echo "ready to run ${subscript} which demultiplexes the pooled fastq file"
+
+function demultiplex () {
+	ScriptStartTime=$(date '+%Y-%m-%d %T')
+	echo "Time $subscript started: $ScriptStartTime"
+	allindexes=$(cat $BARCODES | awk '{print $2}')
+	allsamplenames=$(cat $BARCODES | awk '{print $1}')
+	allspeciesIDs=$(cat $BARCODES | awk '{print $3}')
+	numindexes=$(cat $BARCODES | awk '{print $2}' | wc -l)
+	numsamplenames=$(cat $BARCODES | awk '{print $1}' | wc -l)
+	echo "There are $numindexes indexes: $allindexes"
+	echo "With the corresponding $numsamplenames sample names: $allsamplenames" 
+	echo "With the corresponding species IDs: $allspeciesIDs" 
+	echo "Indicated in the $BARCODES barcode file"
+	echo "Starting demultiplex pipeline on fastq file: $FASTQ"
+	while IFS=$'\t' read -r -a myArray;do
+		bname=${myArray[0]}
+    	bcode=${myArray[1]}
+    	echo "Barcode is $bcode"
+    	echo "Sample name is $bname"
+    	perl $SRCDIR/fastq_filter.pl -v -index 7:$bcode  -of fastq $FASTQ ${DEMULTI_OUT}/$bname.demulti.fastq  
+    	numreads=$(wc -l ${DEMULTI_OUT}/$bname.demulti.fastq | awk '{print $1;}')
+    	echo "$bname has $((numreads/4)) raw_reads" | tee -a CLIPsummary.txt
+	done < $BARCODES
+	fun_check
+}
+skip_function_timed "Do you want to run ${subscript}?" demultiplex
+
+#############################################################################################
+#step 2
+#preprocessing the fastq files
+#includes steps for: 
+	#filter fastq files by read quality. We require a minimum score of 20 at these index/barcode positions and an average score of 20 for the succeeding 25 positions corresponding to the 	first 25-nt of the actual CLIP tags.
+	#Remove 3' linker (GTGTCAGTCACTTCCAGCGG) and any reads shorter than 20 nt
+	#Collapse exact duplicates: If multiple reads have exactly the same sequence, only one is kept.
+	#Remove 5' linker including index, degenerate barcode, and 3 extra nucleotides (DDD) (16 nt total)
+	#Calculate the tag distribution in pre-mapped reads
+	#Each step appends a file called CLIPsummary.txt with reads remaining after each preprocessing step
+
+subscript="preprocessing"
+echo "ready to run ${subscript} which removes 3' linker, collapses duplicates, removes 5' linker"
+
+function preprocessing () {
+		ScriptStartTime=$(date '+%Y-%m-%d %T')
+		echo "Time $subscript started: $ScriptStartTime"
+		for file in ${DEMULTI_OUT}/*.demulti.fastq ; do
+			sample=$(basename $file | cut -f 1 -d ".")
+			echo "Starting preprocessing pipeline for $sample"
+			echo "Filtering $sample"
+		 perl $SRCDIR/fastq_filter.pl -v -f min:0-15:20,mean:16-39:20 -of fastq $file ${FILTERED_OUT}/${sample}.filtered.fastq 
+   		 	filterreads=$(wc -l ${FILTERED_OUT}/${sample}.filtered.fastq   | awk '{print $1;}')
+		 	echo "$sample has $((filterreads/4)) filtered_reads" | tee -a CLIPsummary.txt
+		 	echo "trimming the 3' linker for $sample"
+		 cutadapt -m 20 -a GTGTCAGTCACTTCCAGCGG -o ${RM3LINK_OUT}/$sample.filtered.rm3link.fastq ${FILTERED_OUT}/${sample}.filtered.fastq 
+   	  	 	trimmedthreereads=$(wc -l ${RM3LINK_OUT}/$sample.filtered.rm3link.fastq | awk '{print $1;}')
+		 	echo "$sample has $((trimmedthreereads/4)) rm3link_reads" | tee -a CLIPsummary.txt
+		 	echo "collapsing reads for $sample"
+		 perl $SRCDIR/fastq2collapse.pl -v ${RM3LINK_OUT}/$sample.filtered.rm3link.fastq ${COLLAPSE_OUT}/${sample}.filter.rm3link.collapse.fastq
+		 	collapsedreads=$(wc -l ${COLLAPSE_OUT}/${sample}.filter.rm3link.collapse.fastq | awk '{print $1;}')
+			echo "$sample has $((collapsedreads/4)) collapsed_reads" | tee -a CLIPsummary.txt
+			echo "trimming the 5' barcode linker sequence for $sample"
+		perl $SRCDIR/stripBarcode.pl -len $LEN5LUBr -format fastq ${COLLAPSE_OUT}/${sample}.filter.rm3link.collapse.fastq ${RM5LINK_OUT}/${sample}.filter.rm3link.collapse.rm5link.fastq
+			trimmedfivereads=$(wc -l ${RM5LINK_OUT}/${sample}.filter.rm3link.collapse.rm5link.fastq | awk '{print $1;}')
+			echo "$sample has $((trimmedfivereads/4)) rm5link_reads" | tee -a CLIPsummary.txt
+    	cat ${RM5LINK_OUT}/${sample}.filter.rm3link.collapse.rm5link.fastq | awk '{if(NR%4==2) {print length($0)}}' | sort -n | uniq -c | awk '{print $2"\t"$1}' > ${LEN_DISTRIB_OUT}/${sample}.premap.taglendistrib.txt 
+		done	
+		fun_check
+}
+skip_function_timed "Do you want to run ${subscript}?" preprocessing
+
+#############################################################################################
+#step 3
+#map reads with BWA
+#bwa aln ref.fa short_read.fq > aln_sa.sai
+#bwa samse ref.fa aln_sa.sai short_read.fq > aln-se.sam
+
+subscript="mapping"
+echo "ready to run ${subscript} which maps all fastq files with bwa and creates sam files"
+
+function mapping () {
+	ScriptStartTime=$(date '+%Y-%m-%d %T')
+	echo "Time $subscript started: $ScriptStartTime"
+	while IFS=$'\t' read -r -a myArray;do
+    	bname=${myArray[0]}
+		species=${myArray[2]}
+    	echo "Sample name is $bname"
+		echo "Species is $species"
+		if [[ $species == "mouse" ]]; then 
+			PATH2INDEX_mm10="/Volumes/RS_Darnell_Lab/Indexes/Mus_musculus/UCSC/mm10/Sequence/Chromosomes"
+			echo "Starting BWA mapping and aligning for $bname using species: $species"
+			bwa aln -t 4 -n 0.06 -q 20 $PATH2INDEX_mm10/mm10.fa ${RM5LINK_OUT}/$bname.filter.rm3link.collapse.rm5link.fastq | bwa samse $PATH2INDEX_mm10/mm10.fa - ${RM5LINK_OUT}/$bname.filter.rm3link.collapse.rm5link.fastq  | gzip -c > ${SAM_OUT}/$bname.sam.gz
+		elif [[ $species == "human" ]]; then
+			PATH2INDEX_hg38="/Volumes/RS_Darnell_Lab/Indexes/bwa/hg38"
+			echo "Starting BWA mapping and aligning for $bname using species: $species"
+			bwa aln -t 4 -n 0.06 -q 20 ${PATH2INDEX_hg38}/hg38.fa ${RM5LINK_OUT}/$bname.filter.rm3link.collapse.rm5link.fastq  | bwa samse ${PATH2INDEX_hg38}/hg38.fa - ${RM5LINK_OUT}/$bname.filter.rm3link.collapse.rm5link.fastq  | gzip -c > ${SAM_OUT}/$bname.sam.gz
+		else 
+			echo "species is not specified...exiting"
+			exit 1
+		fi
+	done < $BARCODES
+	fun_check
+}
+skip_function_timed "Do you want to run ${subscript}?" mapping
+
+#############################################################################################
+#step 4
+#parse SAM file
+#takes mapped reads in SAM files and turns them into bed files with "tags"
+#then collapses PCR duplicates to get unique.bed files
+
+subscript="sam2bed"
+echo "ready to run ${subscript} which takes mapped reads in SAM files and turns them into tag bed files and collapses PCR duplicates"
+
+function sam2bed () {
+	ScriptStartTime=$(date '+%Y-%m-%d %T')
+	echo "Time $subscript started: $ScriptStartTime"
+	for file in ${SAM_OUT}/*.sam.gz ; do
+		sample=$(basename $file | cut -f 1 -d ".")
+		echo "Starting SAM parsing for $sample"
+		perl $SRCDIR/parseAlignment.pl -v --map-qual 1 --min-len 18 --mutation-file ${TAGS_OUT}/${sample}.mutation.txt $file ${TAGS_OUT}/${sample}.tag.bed
+		mappedtags=$(wc -l ${TAGS_OUT}/${sample}.tag.bed | awk '{print $1;}')
+		echo "$sample has $mappedtags mapped_tags" | tee -a CLIPsummary.txt
+		perl $SRCDIR/tag2collapse.pl -v --random-barcode -EM 30 --seq-error-model alignment -weight --weight-in-name --keep-max-score --keep-tag-name ${TAGS_OUT}/${sample}.tag.bed ${TAGS_OUT}/${sample}.tag.uniq.bed
+		uniquemappedtags=$(wc -l ${TAGS_OUT}/${sample}.tag.uniq.bed | awk '{print $1;}')
+		echo "$sample has $uniquemappedtags unique_mapped_tags" | tee -a CLIPsummary.txt
+		echo "calculating length distrubtion post-mapping for $sample"
+		awk '{print $3-$2}' ${TAGS_OUT}/${sample}.tag.uniq.bed | sort -n | uniq -c | awk '{print $2"\t"$1}' > ${LEN_DISTRIB_OUT}/${sample}.postmap.taglendistrib.txt 
+	done
+	fun_check
+}
+skip_function_timed "Do you want to run ${subscript}?" sam2bed
+
+#############################################################################################
+#step 5
+#make annotation files and bedgraphs from tags
+
+subscript="tag2anno"
+echo "ready to run ${subscript} which make annotation files and bedgraphs for tags"
+
+function tag2anno () {
+	ScriptStartTime=$(date '+%Y-%m-%d %T')
+	echo "Time $subscript started: $ScriptStartTime"
+	while IFS=$'\t' read -r -a myArray;do
+    	bname=${myArray[0]}
+		species=${myArray[2]}
+    	echo "Sample name is $bname"
+		echo "Species is $species"
+		if [[ $species == "mouse" ]]; then 
+			speciescode="mm10"
+			echo "Starting tag annotations for $bname"
+			perl $SRCDIR/bed2annotation.pl -dbkey $speciescode -ss -big -gene -region -v -summary ${TAGS_ANNO_OUT}/$bname.summary.txt ${TAGS_OUT}/$bname.tag.uniq.bed ${TAGS_ANNO_OUT}/$bname.annot.txt
+			echo "Making bedgraph for $bname"
+			perl $SRCDIR/tag2profile.pl -v -big -ss -exact -of bedgraph -n "Unique Tag Profile" ${TAGS_OUT}/$bname.tag.uniq.bed ${BEDGRAPHS_OUT}/$bname.tag.uniq.bedgraph
+		elif [[ $species == "human" ]]; then
+			speciescode="hg38"
+			echo "Starting tag annotations for $bname"
+			perl $SRCDIR/bed2annotation.pl -dbkey $speciescode -ss -big -gene -region -v -summary ${TAGS_ANNO_OUT}/$bname.summary.txt ${TAGS_OUT}/$bname.tag.uniq.bed ${TAGS_ANNO_OUT}/$bname.annot.txt
+			echo "Making bedgraph for $bname"
+			perl $SRCDIR/tag2profile.pl -v -big -ss -exact -of bedgraph -n "Unique Tag Profile" ${TAGS_OUT}/$bname.tag.uniq.bed ${BEDGRAPHS_OUT}/$bname.tag.uniq.bedgraph
+		else 
+			echo "species is not specified...exiting"
+			exit 1
+		fi
+	done < $BARCODES
+	fun_check
+}
+
+skip_function_timed "Do you want to run ${subscript}?" tag2anno
+
+#############################################################################################
+#step 6
+#takes summary data and makes graphs in R with ggplot
+#run Rscript
+
+subscript="Ranalysis"
+echo "ready to run ${subscript} which takes summary data and makes graphs in R with ggplot"
+
+sort -k1,1 -k3,3nr ${DATA_DIR}/CLIPsummary.txt > ${DATA_DIR}/CLIPsummary_sorted.txt 
+
+function Ranalysis () {
+	ScriptStartTime=$(date '+%Y-%m-%d %T')
+	echo "Time $subscript started: $ScriptStartTime"
+	echo "running R pipeline to make graphs in R"
+	mkdir -p ${DATA_DIR}/Rgraphs
+	path2Rscript="/Users/ruthsinger/Coding/Programs/CLIP_programs/CLIP_graphs_v5.r"
+	echo "script for Rscript is: $path2Rscript"
+	/Library/Frameworks/R.framework/Resources/Rscript ${path2Rscript} --path ${DATA_DIR}
+	fun_check
+}
+
+skip_function_timed "Do you want to run ${subscript}?" Ranalysis
+
+#############################################################################################
+echo "Time script started: $PipelineStartTime"
+#Get current time
+PipelineEndTime=$(date '+%Y-%m-%d %T')
+echo "Time script ended: $PipelineEndTime"
+Pipelinediff=$(datediff  -f "%H:%M:%S" "$PipelineStartTime" "$PipelineEndTime")
+echo "Script took $Pipelinediff (H:M:S) to run"
+echo "**********************************************************************"
+echo "           End of the RAS Pipeline for CLIP analysis                  "
+echo "**********************************************************************"
